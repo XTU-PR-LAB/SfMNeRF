@@ -1,0 +1,17 @@
+expname = scene0316_00_test
+basedir = ./logs
+datadir = ../NoExtNeRF/data/ScanNet/scene0316_00
+siftdir = ../NoExtNeRF/data/ScanNet/scene0316_00/new_sift_correspondences/
+dataset_type = ScanNet
+
+factor = 2
+llffhold = 8
+
+N_rand = 1024
+N_samples = 64
+N_importance = 64
+
+use_viewdirs = True
+raw_noise_std = 1e0
+no_batching = True
+sparse_input_num = 8
