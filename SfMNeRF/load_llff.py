@@ -1,53 +1,14 @@
 import numpy as np
 import os, imageio
+import cv2
+import torch
+import glob
+import re
+from PIL import Image
 
 
 ########## Slightly modified version of LLFF data loading code 
 ##########  see https://github.com/Fyusion/LLFF for original
-
-def load_colmap_data(realdir):
-    
-    camerasfile = os.path.join(realdir, 'sparse/0/cameras.bin')
-    camdata = read_model.read_cameras_binary(camerasfile)
-    
-    # cam = camdata[camdata.keys()[0]]
-    list_of_keys = list(camdata.keys())
-    cam = camdata[list_of_keys[0]]
-    print( 'Cameras', len(cam))
-
-    h, w, f = cam.height, cam.width, cam.params[0]
-    # w, h, f = factor * w, factor * h, factor * f
-    hwf = np.array([h,w,f]).reshape([3,1])
-    
-    imagesfile = os.path.join(realdir, 'sparse/0/images.bin')
-    imdata = read_model.read_images_binary(imagesfile)
-    
-    w2c_mats = []
-    bottom = np.array([0,0,0,1.]).reshape([1,4])
-    
-    names = [imdata[k].name for k in imdata]
-    print( 'Images #', len(names))
-    perm = np.argsort(names)
-    for k in imdata:
-        im = imdata[k]
-        R = im.qvec2rotmat()
-        t = im.tvec.reshape([3,1])
-        m = np.concatenate([np.concatenate([R, t], 1), bottom], 0)
-        w2c_mats.append(m)
-    
-    w2c_mats = np.stack(w2c_mats, 0)
-    c2w_mats = np.linalg.inv(w2c_mats)
-    
-    poses = c2w_mats[:, :3, :4].transpose([1,2,0])
-    poses = np.concatenate([poses, np.tile(hwf[..., np.newaxis], [1,1,poses.shape[-1]])], 1)
-    
-    points3dfile = os.path.join(realdir, 'sparse/0/points3D.bin')
-    pts3d = read_model.read_points3d_binary(points3dfile)
-    
-    # must switch to [-u, r, -t] from [r, -u, t], NOT [r, u, -t]
-    poses = np.concatenate([poses[:, 1:2, :], poses[:, 0:1, :], -poses[:, 2:3, :], poses[:, 3:4, :], poses[:, 4:5, :]], 1)
-    
-    return poses, pts3d, perm
 
 def _minify(basedir, factors=[], resolutions=[]):
     needtoload = False
@@ -105,15 +66,15 @@ def _minify(basedir, factors=[], resolutions=[]):
         
 def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     
-    poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy')) 
-    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])  # [3, 5, 20]
-    bds = poses_arr[:, -2:].transpose([1,0])
+    poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy')) # (imagenumber*17)
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0]) # (3, 5, imagenumber)
+    bds = poses_arr[:, -2:].transpose([1,0]) # (2, imagenumber)
     
     img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
             if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
-    sh = imageio.imread(img0).shape
+    sh = imageio.imread(img0).shape # desk2 (4344, 5792, 3)
     
-    sfx = ''
+    sfx = '' 
     
     if factor is not None:
         sfx = '_{}'.format(factor)
@@ -136,15 +97,15 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     if not os.path.exists(imgdir):
         print( imgdir, 'does not exist, returning' )
         return
-
+    # imgfiles list
     imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
     if poses.shape[-1] != len(imgfiles):
         print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
         return
     
-    sh = imageio.imread(imgfiles[0]).shape
-    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) 
-    poses[2, 4, :] = poses[2, 4, :] * 1./factor 
+    sh = imageio.imread(imgfiles[0]).shape # image shape, desk2(543, 724, 3)
+    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # (3, 5, imagenumber)
+    poses[2, 4, :] = poses[2, 4, :] * 1./factor
     
     if not load_imgs:
         return poses, bds
@@ -155,8 +116,8 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
         else:
             return imageio.imread(f)
         
-    imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles] 
-    imgs = np.stack(imgs, -1)  
+    imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
+    imgs = np.stack(imgs, -1) #(543, 727,3 ,1 151) 
     
     print('Loaded image data', imgs.shape, poses[:,-1,0])
     return poses, bds, imgs
@@ -186,7 +147,7 @@ def poses_avg(poses):
     hwf = poses[0, :3, -1:]
 
     center = poses[:, :3, 3].mean(0)
-    vec2 = normalize(poses[:, :3, 2].sum(0)) # 旋转矩阵中的列向量为摄像机坐标系中对应的轴在全局坐标系中的方向
+    vec2 = normalize(poses[:, :3, 2].sum(0))
     up = poses[:, :3, 1].sum(0)
     c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)
     
@@ -216,7 +177,7 @@ def recenter_poses(poses):
     bottom = np.tile(np.reshape(bottom, [1,1,4]), [poses.shape[0],1,1])
     poses = np.concatenate([poses[:,:3,:4], bottom], -2)
 
-    poses = np.linalg.inv(c2w) @ poses  # @在Python3.5之前不受支持。如果您有一个较旧的版本，也许可以使用numpy.dot以这种方式运行：poses = np.dot(np.linalg.inv(c2w), poses)
+    poses = np.linalg.inv(c2w) @ poses
     poses_[:,:3,:4] = poses[:,:3,:4]
     poses = poses_
     return poses
@@ -286,21 +247,20 @@ def spherify_poses(poses, bds):
 
 def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False):
     
-    # poses - [3, 5, 20]
-    poses, bds, imgs = _load_data(basedir, factor=factor) # factor=8 downsamples original imgs by 8x
+
+    poses, bds, imgs = _load_data(basedir, factor=factor) # factor=8 downsamples original imgs by 8x // DTU set for width=500
     print('Loaded', basedir, bds.min(), bds.max())
     
     # Correct rotation matrix ordering and move variable dim to axis 0
-    # 这里摄像机的视点方向与数据库中定义的不一样，要转过来；数据库中的摄像机各轴主方向是向下，向右，向后[-y,x,z]
-    poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1) # 转成[x,y,z]形式
-    poses = np.moveaxis(poses, -1, 0).astype(np.float32) # [20, 3, 5]
-    imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)  # [b, h, w, c]
-    images = imgs
+    poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
+    poses = np.moveaxis(poses, -1, 0).astype(np.float32) #（151， 3， 5）
+    imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)
+    images = imgs #（151， 543，727， 3）
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)
     
     # Rescale if bd_factor is provided
     sc = 1. if bd_factor is None else 1./(bds.min() * bd_factor)
-    poses[:,:3,3] *= sc # 将位移乘上这个比例因子，当bd_factor<1.0，摄像机离场景更近，为了保证场景在摄像机坐标下的坐标不变，则相当于将场景进行了bd_factor比例缩小
+    poses[:,:3,3] *= sc
     bds *= sc
     
     if recenter:
@@ -359,6 +319,512 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     poses = poses.astype(np.float32)
 
     return images, poses, bds, render_poses, i_test
+
+def read_pfm(filename):
+    file = open(filename, 'rb')
+    color = None
+    width = None
+    height = None
+    scale = None
+    endian = None
+
+    header = file.readline().decode('utf-8').rstrip()
+    if header == 'PF':
+        color = True
+    elif header == 'Pf':
+        color = False
+    else:
+        raise Exception('Not a PFM file.')
+
+    dim_match = re.match(r'^(\d+)\s(\d+)\s$', file.readline().decode('utf-8'))
+    if dim_match:
+        width, height = map(int, dim_match.groups())
+    else:
+        raise Exception('Malformed PFM header.')
+
+    scale = float(file.readline().rstrip())
+    if scale < 0:  # little-endian
+        endian = '<'
+        scale = -scale
+    else:
+        endian = '>'  # big-endian
+
+    data = np.fromfile(file, endian + 'f')
+    shape = (height, width, 3) if color else (height, width)
+
+    data = np.reshape(data, shape)
+    data = np.flipud(data)
+    file.close()
+    return data, scale
+
+def read_mask_hr(filename):
+    img = Image.open(filename)
+    np_img = np.array(img, dtype=np.float32)
+    np_img = (np_img > 10).astype(np.float32)
+    return np_img
+
+
+def load_DTU_depth(basedir, factor=8):
+    img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
+            if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
+    
+    scan_filename = os.path.basename(basedir)
+    father_dir = os.path.dirname(basedir)
+    father_dir = os.path.dirname(father_dir)
+    
+    all_depths = []  
+    all_masks = [] 
+    
+    for vid in range(len(img0)):
+        depth_filename_hr = os.path.join(father_dir, 'Depths_raw', scan_filename, 'depth_map_{:0>4}.pfm'.format(vid))
+        depth_raw = np.array(read_pfm(depth_filename_hr)[0], dtype=np.float32)
+        h, w = depth_raw.shape
+        depths = cv2.resize(depth_raw, (w // factor, h // factor), interpolation=cv2.INTER_NEAREST)
+        all_depths.append(depths) 
+        mask_filename_hr = os.path.join(father_dir, 'Depths_raw', scan_filename, 'depth_visual_{:0>4}.png'.format(vid))
+        mask_img = read_mask_hr(mask_filename_hr)
+        h, w = mask_img.shape
+        mask_img = cv2.resize(mask_img, (w // factor, h // factor), interpolation=cv2.INTER_NEAREST)
+        all_masks.append(mask_img) 
+
+    depths = np.stack(all_depths)
+    depths = depths.transpose(1, 2, 0)
+    masks = np.stack(all_masks)
+    masks = masks.transpose(1, 2, 0)
+    
+    sh = imageio.imread(img0).shape # desk2 (4344, 5792, 3)
+    
+    sfx = '' # (default=8)
+    
+    if factor is not None:
+        sfx = '_{}'.format(factor)
+        factor = factor
+    elif height is not None:
+        factor = sh[0] / float(height)
+        width = int(sh[1] / factor)
+        sfx = '_{}x{}'.format(width, height)
+    elif width is not None:
+        factor = sh[1] / float(width)
+        height = int(sh[0] / factor)
+        sfx = '_{}x{}'.format(width, height)
+    else:
+        factor = 1
+    
+    imgdir = os.path.join(basedir, 'images' + sfx)
+    if not os.path.exists(imgdir):
+        print( imgdir, 'does not exist, returning' )
+        return
+    # imgfiles list
+    imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    if len(imgfiles) < depths.shape[-1]:
+        depths = depths[:, :, :len(imgfiles)] 
+        masks = masks[:, :, :len(imgfiles)]
+    return depths, masks
+
+
+def load_ScanNet_depth(basedir, factor=8):
+    imgs = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
+            if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    depth_files = [os.path.join(basedir, 'depth', f) for f in sorted(os.listdir(os.path.join(basedir, 'depth'))) \
+            if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    all_depths = []     
+    img_h, img_w, _ = imageio.imread(imgs[0]).shape # 
+    for vid in range(len(imgs)):
+        depth_raw = imageio.imread(depth_files[vid], ignoregamma=True)
+        # h, w = depth_raw.shape
+        depths = cv2.resize(depth_raw, (img_w // factor, img_h // factor), interpolation=cv2.INTER_NEAREST)
+        all_depths.append(depths)  
+    depths = np.stack(all_depths)
+    # depths = depths.transpose(1, 2, 0)  
+    
+    return depths
+
+
+def _load_ScanNet_data(basedir, factor=None, width=None, height=None, load_imgs=True):
+    
+    # poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy')) 
+    # poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0]) # (3, 5, imagenumber)
+    # bds = poses_arr[:, -2:].transpose([1,0]) # (2, imagenumber)
+    
+    imgs = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
+            if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    
+    depth_files = [os.path.join(basedir, 'depth', f) for f in sorted(os.listdir(os.path.join(basedir, 'depth'))) \
+            if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    
+    pose_files = [os.path.join(basedir, 'pose', f) for f in sorted(os.listdir(os.path.join(basedir, 'pose'))) \
+            if f.endswith('txt')]
+
+    
+    all_poses = [] 
+    all_depths = [] 
+    all_bds = []
+    intrinic_filename = os.path.join(basedir, 'intrinsic/intrinsic_color.txt')
+    with open(intrinic_filename) as f:
+        lines = f.readlines()
+        lines = [line.rstrip() for line in lines]
+    # extrinsics: line [1,5), 4x4 matrix
+    K = np.fromstring(' '.join(lines[0:4]), dtype=np.float32, sep=' ').reshape((4, 4)) 
+    K = K[0:3, 0:3]    
+    img_h, img_w, _ = imageio.imread(imgs[0]).shape # 
+    for vid in range(len(imgs)):
+        depth_raw = imageio.imread(depth_files[vid], ignoregamma=True)
+        # h, w = depth_raw.shape
+        depths = cv2.resize(depth_raw, (img_w // factor, img_h // factor), interpolation=cv2.INTER_NEAREST)
+        all_depths.append(depths)  
+        
+        bds = np.array([[np.min(depth_raw)], [np.max(depth_raw)]],dtype =np.float64)
+        all_bds.append(bds)
+                 
+        
+
+        with open(pose_files[vid]) as f:
+            lines = f.readlines()
+            lines = [line.rstrip() for line in lines]
+        extrinsics = np.fromstring(' '.join(lines[0:4]), dtype=np.float32, sep=' ').reshape((4, 4))
+    
+        focal = (K[0][0] + K[1][1])/2.0
+        poses_temp = np.concatenate([extrinsics[:3, :], np.array([[img_h], [img_w], [focal]])], axis=1)
+        all_poses.append(poses_temp)  # [3, 5]
+    poses = np.stack(all_poses)
+    poses = poses.transpose(1, 2, 0)
+    depths = np.stack(all_depths)
+    depths = depths.transpose(1, 2, 0)
+    bds = np.stack(all_bds).squeeze(-1)
+    bds = bds.transpose(1, 0)
+
+    
+    sh = imageio.imread(imgs[0]).shape # desk2 (4344, 5792, 3)
+    
+    sfx = '' # (default=8)
+    
+    if factor is not None:
+        sfx = '_{}'.format(factor)
+        _minify(basedir, factors=[factor])
+        factor = factor
+    elif height is not None:
+        factor = sh[0] / float(height)
+        width = int(sh[1] / factor)
+        _minify(basedir, resolutions=[[height, width]])
+        sfx = '_{}x{}'.format(width, height)
+    elif width is not None:
+        factor = sh[1] / float(width)
+        height = int(sh[0] / factor)
+        _minify(basedir, resolutions=[[height, width]])
+        sfx = '_{}x{}'.format(width, height)
+    else:
+        factor = 1
+    
+    imgdir = os.path.join(basedir, 'images' + sfx)
+    if not os.path.exists(imgdir):
+        print( imgdir, 'does not exist, returning' )
+        return
+    # imgfiles list
+    imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    if len(imgfiles) < poses.shape[-1]:
+        poses = poses[:, :, :len(imgfiles)]    
+        depths = depths[:, :, :len(imgfiles)] 
+        bds = bds[:, :len(imgfiles)]
+    if poses.shape[-1] != len(imgfiles):
+        print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
+        return
+    
+    sh = imageio.imread(imgfiles[0]).shape # image shape, desk2(543, 724, 3)
+    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # (3, 5, imagenumber)
+    poses[2, 4, :] = poses[2, 4, :] * 1./factor
+    
+    K[0,0] = K[0,0]/factor
+    K[1,1] = K[1,1]/factor
+    K[0,2] = K[0,2]/factor
+    K[1,2] = K[1,2]/factor
+    
+    if not load_imgs:
+        return poses, bds
+    
+    def imread(f):
+        if f.endswith('png'):
+            return imageio.imread(f, ignoregamma=True)
+        else:
+            return imageio.imread(f)
+        
+    imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
+    imgs = np.stack(imgs, -1) #(543, 727,3 ,1 151) 
+    
+    print('Loaded image data', imgs.shape, poses[:,-1,0])
+    return poses, bds, imgs, K, depths
+
+def load_ScanNet_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False):
+    
+
+    poses, bds, imgs, K, depths = _load_ScanNet_data(basedir, factor=factor) # factor=4 downsamples original imgs by 4x for DTU
+    print('Loaded', basedir, bds.min(), bds.max())
+    
+    # Correct rotation matrix ordering and move variable dim to axis 0
+    poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
+    poses = np.moveaxis(poses, -1, 0).astype(np.float32) #（151， 3， 5）
+    imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)
+    images = imgs #（151， 543，727， 3）
+    bds = np.moveaxis(bds, -1, 0).astype(np.float32)
+
+    sc = 1.
+    poses[:,:3,3] *= sc
+    bds *= sc
+    
+    if recenter:
+        poses = recenter_poses(poses)
+        
+    if spherify:
+        poses, render_poses, bds = spherify_poses(poses, bds)
+
+    else:
+        
+        c2w = poses_avg(poses)
+        print('recentered', c2w.shape)
+        print(c2w[:3,:4])
+
+        ## Get spiral
+        # Get average pose
+        up = normalize(poses[:, :3, 1].sum(0))
+
+        # Find a reasonable "focus depth" for this dataset
+        close_depth, inf_depth = bds.min()*.9, bds.max()*5.
+        dt = .75
+        mean_dz = 1./(((1.-dt)/close_depth + dt/inf_depth))
+        focal = mean_dz
+
+        # Get radii for spiral path
+        shrink_factor = .8
+        zdelta = close_depth * .2
+        tt = poses[:,:3,3] # ptstocam(poses[:3,3,:].T, c2w).T
+        rads = np.percentile(np.abs(tt), 90, 0)
+        c2w_path = c2w
+        N_views = 120
+        N_rots = 2
+        if path_zflat:
+#             zloc = np.percentile(tt, 10, 0)[2]
+            zloc = -close_depth * .1
+            c2w_path[:3,3] = c2w_path[:3,3] + zloc * c2w_path[:3,2]
+            rads[2] = 0.
+            N_rots = 1
+            N_views/=2
+
+        # Generate poses for spiral path
+        render_poses = render_path_spiral(c2w_path, up, rads, focal, zdelta, zrate=.5, rots=N_rots, N=N_views)
+        
+        
+    render_poses = np.array(render_poses).astype(np.float32)
+
+    c2w = poses_avg(poses)
+    print('Data:')
+    print(poses.shape, images.shape, bds.shape)
+    
+    dists = np.sum(np.square(c2w[:3,3] - poses[:,:3,3]), -1)
+    i_test = np.argmin(dists)
+    print('HOLDOUT view is', i_test)
+    
+    images = images.astype(np.float32)
+    poses = poses.astype(np.float32)
+
+    return images, poses, bds, render_poses, i_test, K, depths
+
+
+def read_DTU_cam_file(filename):
+    with open(filename) as f:
+        lines = f.readlines()
+        lines = [line.rstrip() for line in lines]
+    # extrinsics: line [1,5), 4x4 matrix
+    extrinsics = np.fromstring(' '.join(lines[1:5]), dtype=np.float32, sep=' ').reshape((4, 4))
+    # intrinsics: line [7-10), 3x3 matrix
+    intrinsics = np.fromstring(' '.join(lines[7:10]), dtype=np.float32, sep=' ').reshape((3, 3))
+
+    return intrinsics, extrinsics #, depth_min, depth_interval
+
+
+def read_depth(filename):
+    # read pfm depth file
+    return np.array(read_pfm(filename)[0], dtype=np.float32)
+
+def _load_DTU_data(basedir, factor=None, width=None, height=None, load_imgs=True):
+    
+    
+    img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
+            if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
+    
+    scan_filename = os.path.basename(basedir)
+    father_dir = os.path.dirname(basedir)
+    father_dir = os.path.dirname(father_dir)
+    
+    all_poses = [] 
+    all_depths = []  
+    all_masks = [] 
+   
+    for vid in range(len(img0)):
+        depth_filename_hr = os.path.join(father_dir, 'Depths_raw', scan_filename, 'depth_map_{:0>4}.pfm'.format(vid))
+        depth_raw = np.array(read_pfm(depth_filename_hr)[0], dtype=np.float32)
+        h, w = depth_raw.shape
+        depths = cv2.resize(depth_raw, (w // factor, h // factor), interpolation=cv2.INTER_NEAREST)
+        all_depths.append(depths) 
+        mask_filename_hr = os.path.join(father_dir, 'Depths_raw', scan_filename, 'depth_visual_{:0>4}.png'.format(vid))
+        mask_img = read_mask_hr(mask_filename_hr)
+        h, w = mask_img.shape
+        mask_img = cv2.resize(mask_img, (w // factor, h // factor), interpolation=cv2.INTER_NEAREST)
+        all_masks.append(mask_img) 
+        
+        
+        camera_filename = os.path.join(father_dir, 'Cameras', '{:0>8}_cam.txt').format(vid)
+        K, extrinsics = read_DTU_cam_file(camera_filename)
+        focal = (K[0][0] + K[1][1])/2.0
+        poses_temp = np.concatenate([extrinsics[:3, :], np.array([[h], [w], [focal]])], axis=1)
+        all_poses.append(poses_temp)  # [3, 5]
+    poses = np.stack(all_poses)
+    poses = poses.transpose(1, 2, 0)
+    depths = np.stack(all_depths)
+    depths = depths.transpose(1, 2, 0)
+    masks = np.stack(all_masks)
+    masks = masks.transpose(1, 2, 0)
+    bds = np.array([[2.5], [425.0]],dtype =np.float64)
+    bds= bds.repeat(poses.shape[2], axis=1)
+
+    
+    sh = imageio.imread(img0).shape # desk2 (4344, 5792, 3)
+    
+    sfx = '' # (default=8)
+    
+    if factor is not None:
+        sfx = '_{}'.format(factor)
+        _minify(basedir, factors=[factor])
+        factor = factor
+    elif height is not None:
+        factor = sh[0] / float(height)
+        width = int(sh[1] / factor)
+        _minify(basedir, resolutions=[[height, width]])
+        sfx = '_{}x{}'.format(width, height)
+    elif width is not None:
+        factor = sh[1] / float(width)
+        height = int(sh[0] / factor)
+        _minify(basedir, resolutions=[[height, width]])
+        sfx = '_{}x{}'.format(width, height)
+    else:
+        factor = 1
+    
+    imgdir = os.path.join(basedir, 'images' + sfx)
+    if not os.path.exists(imgdir):
+        print( imgdir, 'does not exist, returning' )
+        return
+    # imgfiles list
+    imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    if len(imgfiles) < poses.shape[-1]:
+        poses = poses[:, :, :len(imgfiles)]    
+        depths = depths[:, :, :len(imgfiles)] 
+        masks = masks[:, :, :len(imgfiles)]
+        bds = bds[:, :len(imgfiles)]
+    if poses.shape[-1] != len(imgfiles):
+        print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
+        return
+    
+    sh = imageio.imread(imgfiles[0]).shape # image shape, desk2(543, 724, 3)
+    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # (3, 5, imagenumber)
+    poses[2, 4, :] = poses[2, 4, :] * 1./factor
+    
+    K[0,0] = K[0,0]/factor
+    K[1,1] = K[1,1]/factor
+    K[0,2] = K[0,2]/factor
+    K[1,2] = K[1,2]/factor
+    
+    if not load_imgs:
+        return poses, bds
+    
+    def imread(f):
+        if f.endswith('png'):
+            return imageio.imread(f, ignoregamma=True)
+        else:
+            return imageio.imread(f)
+        
+    imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
+    imgs = np.stack(imgs, -1) #(543, 727,3 ,1 151) 
+    
+    print('Loaded image data', imgs.shape, poses[:,-1,0])
+    return poses, bds, imgs, K, depths, masks
+
+def load_DTU_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False):
+    
+
+    poses, bds, imgs, K, depths, masks = _load_DTU_data(basedir, factor=factor) # factor=4 downsamples original imgs by 4x for DTU
+    print('Loaded', basedir, bds.min(), bds.max())
+    
+    # Correct rotation matrix ordering and move variable dim to axis 0
+    poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
+    poses = np.moveaxis(poses, -1, 0).astype(np.float32) #（151， 3， 5）
+    imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)
+    images = imgs #（151， 543，727， 3）
+    bds = np.moveaxis(bds, -1, 0).astype(np.float32)
+    
+    # Rescale if bd_factor is provided
+    sc = 1. if bd_factor is None else 1./(bds.min() * bd_factor)
+    poses[:,:3,3] *= sc
+    bds *= sc
+    
+    if recenter:
+        poses = recenter_poses(poses)
+        
+    if spherify:
+        poses, render_poses, bds = spherify_poses(poses, bds)
+
+    else:
+        
+        c2w = poses_avg(poses)
+        print('recentered', c2w.shape)
+        print(c2w[:3,:4])
+
+        ## Get spiral
+        # Get average pose
+        up = normalize(poses[:, :3, 1].sum(0))
+
+        # Find a reasonable "focus depth" for this dataset
+        close_depth, inf_depth = bds.min()*.9, bds.max()*5.
+        dt = .75
+        mean_dz = 1./(((1.-dt)/close_depth + dt/inf_depth))
+        focal = mean_dz
+
+        # Get radii for spiral path
+        shrink_factor = .8
+        zdelta = close_depth * .2
+        tt = poses[:,:3,3] # ptstocam(poses[:3,3,:].T, c2w).T
+        rads = np.percentile(np.abs(tt), 90, 0)
+        c2w_path = c2w
+        N_views = 120
+        N_rots = 2
+        if path_zflat:
+#             zloc = np.percentile(tt, 10, 0)[2]
+            zloc = -close_depth * .1
+            c2w_path[:3,3] = c2w_path[:3,3] + zloc * c2w_path[:3,2]
+            rads[2] = 0.
+            N_rots = 1
+            N_views/=2
+
+        # Generate poses for spiral path
+        render_poses = render_path_spiral(c2w_path, up, rads, focal, zdelta, zrate=.5, rots=N_rots, N=N_views)
+        
+        
+    render_poses = np.array(render_poses).astype(np.float32)
+
+    c2w = poses_avg(poses)
+    print('Data:')
+    print(poses.shape, images.shape, bds.shape)
+    
+    dists = np.sum(np.square(c2w[:3,3] - poses[:,:3,3]), -1)
+    i_test = np.argmin(dists)
+    print('HOLDOUT view is', i_test)
+    
+    images = images.astype(np.float32)
+    poses = poses.astype(np.float32)
+
+    return images, poses, bds, render_poses, i_test, K, depths, masks
+
+
+
+
+
 
 
 

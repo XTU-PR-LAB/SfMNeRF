@@ -86,7 +86,7 @@ def load_LINEMOD_data(basedir, half_res=False, testskip=1):
         for i, img in enumerate(imgs):
             imgs_half_res[i] = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
         imgs = imgs_half_res
-        # imgs = tf.image.resize_area(imgs, [400, 400]).numpy()
+
 
     near = np.floor(min(metas['train']['near'], metas['test']['near']))
     far = np.ceil(max(metas['train']['far'], metas['test']['far']))
